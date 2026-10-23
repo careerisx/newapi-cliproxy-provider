@@ -20,16 +20,14 @@ import (
 // ProviderID 是本插件唯一的认证和模型归属标识。
 const ProviderID = "newapi"
 
-// pluginName / pluginVersion are reported in registration metadata.
-const (
-	// pluginName 是宿主注册使用的稳定插件名称。
-	pluginName = "newapi-provider"
-	// pluginVersion 标记当前插件实现版本。
-	pluginVersion = "0.1.0"
-)
+// pluginName 是宿主注册使用的稳定插件名称。
+const pluginName = "newapi-provider"
+
+// pluginVersion 是本地构建的默认版本，Release 构建通过 -ldflags -X 注入 tag 版本。
+var pluginVersion = "0.1.0"
 
 // githubRepoURL 指向本插件的源码及 Release 发布仓库，供宿主识别更新来源。
-const githubRepoURL = "https://github.com/careerisx/cpa-plusins"
+const githubRepoURL = "https://github.com/careerisx/newapi-cliproxy-provider"
 
 // registerRefreshTimeout 限制按需目录发现的同步等待时间。
 const registerRefreshTimeout = 10 * time.Second
