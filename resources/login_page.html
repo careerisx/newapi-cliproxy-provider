@@ -1,0 +1,375 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>New API 认证管理</title>
+<style>
+body{font-family:system-ui,sans-serif;max-width:1080px;margin:32px auto;padding:0 20px;color:#182235;background:#f5f7fa}section{background:white;border:1px solid #dce1e8;border-radius:10px;padding:24px;margin:20px 0}h1{font-size:26px}h2{font-size:20px}label{display:block;margin-top:14px}input,select,button{box-sizing:border-box;width:100%;padding:10px;margin-top:6px;border:1px solid #aab5c3;border-radius:5px}input[type=checkbox]{width:auto;margin-right:8px}button{background:#2458bb;color:white;cursor:pointer}button:disabled{opacity:.55;cursor:default}.grid{display:grid;grid-template-columns:1fr 1fr;gap:0 24px}.hint{color:#526174;font-size:14px;line-height:1.7}.scroll{overflow:auto}table{border-collapse:collapse;width:100%;font-size:14px}th,td{text-align:left;padding:10px;border-bottom:1px solid #dce1e8;vertical-align:top;overflow-wrap:anywhere;min-width:85px}#message{white-space:pre-wrap;line-height:1.7}button#refresh{max-width:180px}@media(max-width:650px){.grid{grid-template-columns:1fr}section{padding:16px}}
+</style>
+</head>
+<body>
+<h1>New API 认证管理</h1>
+<p class="hint">添加、查看和编辑本插件认证。保存只校验字段，不代表上游权限验证成功。删除和启停请使用 CPA 管理功能。</p>
+<section>
+<label for="password">CPA 管理密码</label>
+<input id="password" type="password" autocomplete="off" placeholder="显式输入宿主管理密码" required>
+<p class="hint">手动密码优先。仅随同源管理请求发送，不写入浏览器持久存储或地址栏。</p>
+<p id="auth-message" role="status" aria-live="polite">正在检查 CPA 保存的登录…</p>
+<button id="manual" type="button">切换为手动密码</button>
+</section>
+<section>
+<h2 id="form-title">添加认证</h2>
+<p id="edit-message" class="hint">新增认证必须填写 API key；系统令牌与用户 ID 必须成对填写。</p>
+<form id="add" autocomplete="off">
+<div class="grid">
+<label>名称<input id="label" maxlength="256" required></label>
+<label>base_url（必填）<input id="base" type="url" placeholder="https://api.example.com/v1" required></label>
+<label><span id="key-label">API key（必填）</span><input id="key" type="password" autocomplete="off" required></label>
+<label>上游协议<select id="format"><option value="openai">openai — Chat Completions</option><option value="claude">claude — Messages</option><option value="openai-response">openai-response — Responses</option></select></label>
+<label>quota-url（可选）<input id="quota" type="url" placeholder="https://site.example.com/api/user/self"></label>
+<label>catalog-url（可选）<input id="catalog" type="url" placeholder="留空按 base_url 推导"></label>
+<label><input id="prefix-enabled" type="checkbox" checked>启用模型前缀</label>
+<label>模型前缀值<input id="prefix" value="newapi"></label>
+<label>系统访问令牌（可选）<input id="system" type="password" autocomplete="off"></label>
+<label>用户 ID（与系统令牌成对）<input id="user" inputmode="numeric" pattern="[0-9]*" placeholder="正十进制整数"></label>
+</div>
+<label><input id="http" type="checkbox">仅对此认证允许 HTTP（默认关闭）</label>
+<p class="hint">目录和推理仅使用 API key；账号余额仅使用系统令牌和用户 ID。填写的上游、目录和额度地址必须可信。</p>
+<label id="clear-label" hidden><input id="clear-balance" type="checkbox">明确删除已有系统令牌和用户 ID（不能同时填写替换值）</label>
+<button id="save" type="submit">保存认证</button>
+<button id="cancel-edit" type="button" hidden>取消编辑</button>
+</form>
+<p id="message" role="status" aria-live="polite"></p>
+</section>
+<section>
+<h2>当前认证</h2>
+<button id="refresh" type="button">刷新列表</button>
+<p id="list-message" role="status" aria-live="polite">输入管理密码后刷新。列表包含禁用认证，不显示密钥、完整 JSON 或物理路径。</p>
+<div class="scroll"><table><thead><tr><th>文件名 / 名称</th><th>状态</th><th>base_url</th><th>协议</th><th>模型前缀</th><th>凭据存在标记</th><th>操作</th></tr></thead><tbody id="items"></tbody></table></div>
+</section>
+<script>
+'use strict';
+// element 只获取静态页面节点，动态数据仅使用 textContent 或 value。
+function element(id) { return document.getElementById(id); }
+// 管理地址沿用当前页面的同源部署前缀，不接受外部传入的地址。
+const suffix = '/v0/resource/plugins/newapi-provider/login';
+const currentPath = location.pathname;
+const prefix = currentPath.endsWith(suffix) ? currentPath.slice(0, -suffix.length) : null;
+const endpoint = prefix === null ? null : new URL(prefix + '/v0/management/plugins/newapi-provider/auths', location.origin);
+// 请求互斥及未知写入锁独立于编辑状态，取消编辑不能解除未知结果锁。
+let busy = false;
+let uncertain = false;
+// 保存登录仅在内存中持有，验证前不能用于写入；切换手动后立即丢弃。
+let savedKey = '';
+let savedVerified = false;
+let authGeneration = 0;
+// 编辑快照仅包含白名单安全配置和凭据存在标记，不持有上游凭据。
+let editing = null;
+
+// readSavedKey 按 CPA 的真实存储算法解码；未知版本、损坏和存储异常均回退手动。
+function readSavedKey() {
+  try {
+    const raw = localStorage.getItem('cli-proxy-auth');
+    if (!raw) return '';
+    let decoded = raw;
+    if (raw.startsWith('enc::')) {
+      if (!raw.startsWith('enc::v1::')) return '';
+      const bytes = Uint8Array.from(atob(raw.slice(9)), char => char.charCodeAt(0));
+      const seed = new TextEncoder().encode('cli-proxy-api-webui::secure-storage|' + location.host + '|' + navigator.userAgent);
+      for (let i = 0; i < bytes.length; i++) bytes[i] ^= seed[i % seed.length];
+      decoded = new TextDecoder('utf-8', {fatal: true}).decode(bytes);
+    }
+    const key = JSON.parse(decoded)?.state?.managementKey;
+    return typeof key === 'string' && key.trim() ? key : '';
+  } catch (_) { return ''; }
+}
+
+// updateButtons 在请求和未知保存期间禁止编辑及提交，刷新仍可用于人工确认。
+function updateButtons() {
+  element('save').disabled = busy || uncertain || !endpoint;
+  element('refresh').disabled = busy || !endpoint;
+  element('cancel-edit').disabled = busy;
+  for (const button of element('items').querySelectorAll('button')) {
+    button.disabled = busy || uncertain || button.dataset.blocked === 'true';
+  }
+  for (const field of element('add').querySelectorAll('input, select')) field.disabled = busy || uncertain;
+}
+
+// useManual 不修改宿主存储，代际标记防止进行中的自动验证覆盖手动选择。
+function useManual(focus) {
+  authGeneration++;
+  savedKey = '';
+  savedVerified = false;
+  element('auth-message').textContent = '正在使用手动管理密码；本页不会保存密码。';
+  if (focus) element('password').focus();
+}
+
+// managementFetch 仅向同源接口发送当前凭据，候选仅允许用于一次启动 GET 验证。
+async function managementFetch(method, body, candidate = '') {
+  const manual = element('password').value;
+  const password = manual || (savedVerified ? savedKey : (method === 'GET' ? candidate : ''));
+  if (!password) throw new Error('missing-password');
+  if (!endpoint || endpoint.origin !== location.origin) throw new Error('invalid-path');
+  const headers = {Authorization: 'Bearer ' + password, Accept: 'application/json'};
+  if (body !== undefined) headers['Content-Type'] = 'application/json';
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 45000);
+  try {
+    const response = await fetch(endpoint, {method, headers, body: body === undefined ? undefined : JSON.stringify(body),
+      cache: 'no-store', credentials: 'omit', redirect: 'error', referrerPolicy: 'no-referrer', signal: controller.signal});
+    if (response.status === 401 || response.status === 403) {
+      useManual(true);
+      element('auth-message').textContent = '管理认证失败（' + response.status + '），已停用保存登录，请手动输入 CPA 管理密码。';
+    }
+    return response;
+  } finally { clearTimeout(timeout); }
+}
+
+// editableConfig 拒绝用缺失配置生成 PATCH，避免旧后端列表导致安全配置被意外清空。
+function editableConfig(item) {
+  return typeof item.name === 'string' && Boolean(item.name) && typeof item.label === 'string' &&
+    typeof item.base_url === 'string' && typeof item['upstream-format'] === 'string' &&
+    typeof item['quota-url'] === 'string' && typeof item['catalog-url'] === 'string' &&
+    typeof item['allow-http'] === 'boolean' && typeof item.prefix_enabled === 'boolean' &&
+    typeof item.prefix_value === 'string' && typeof item.has_api_key === 'boolean' &&
+    typeof item.has_system_token === 'boolean' && typeof item.has_user_id === 'boolean';
+}
+
+// clearSecrets 清空上游敏感输入，不回显系统令牌、用户 ID 或已有 API key。
+function clearSecrets() {
+  element('key').value = ''; element('system').value = ''; element('user').value = '';
+}
+
+// cancelEdit 返回新增模式，但不解除未知保存锁，也不会发送请求。
+function cancelEdit() {
+  editing = null;
+  element('add').reset();
+  for (const option of element('format').querySelectorAll('option[data-original]')) option.remove();
+  element('format').value = 'openai';
+  clearSecrets();
+  element('key').required = true;
+  element('key-label').textContent = 'API key（必填）';
+  element('form-title').textContent = '添加认证';
+  element('edit-message').textContent = '新增认证必须填写 API key；系统令牌与用户 ID 必须成对填写。';
+  element('clear-label').hidden = true;
+  element('cancel-edit').hidden = true;
+  element('save').textContent = '保存认证';
+  updateButtons();
+}
+
+// startEdit 只回填安全配置；保存时由后端读取最新记录合并，不发送整份认证或版本。
+function startEdit(item) {
+  if (busy || uncertain || item.disabled || !editableConfig(item)) return;
+  editing = {...item};
+  clearSecrets();
+  element('label').value = item.label;
+  element('base').value = item.base_url;
+  // 未知协议通过临时选项保留原值，允许修复无效认证而不静默覆盖配置。
+  for (const option of element('format').querySelectorAll('option[data-original]')) option.remove();
+  const originalFormat = item['upstream-format'];
+  if (originalFormat && !['openai', 'claude', 'openai-response'].includes(originalFormat)) {
+    const option = document.createElement('option');
+    option.value = originalFormat;
+    option.textContent = '原始未知协议（请选择受支持协议修复）：' + originalFormat;
+    option.dataset.original = 'true';
+    element('format').appendChild(option);
+  }
+  element('format').value = originalFormat || 'openai';
+  element('quota').value = item['quota-url'];
+  element('catalog').value = item['catalog-url'];
+  element('prefix-enabled').checked = item.prefix_enabled;
+  element('prefix').value = item.prefix_value;
+  element('http').checked = item['allow-http'];
+  element('clear-balance').checked = false;
+  element('key').required = false;
+  element('key-label').textContent = 'API key（留空保留原值）';
+  element('form-title').textContent = '编辑认证：' + item.name;
+  element('edit-message').textContent = '敏感值不回显，留空保留。系统令牌：' + (item.has_system_token ? '已存在' : '不存在') +
+    '；用户 ID：' + (item.has_user_id ? '已存在' : '不存在') + '。可结合已有标记只替换一项；删除须明确勾选。后端按最新记录合并，无版本冲突保护。' +
+    (!originalFormat ? ' 原协议为空，已默认选择 openai，请确认后保存。' :
+      (!['openai', 'claude', 'openai-response'].includes(originalFormat) ? ' 原协议不受支持，已保留原值，请选择支持的协议修复。' : ''));
+  element('clear-label').hidden = false;
+  element('cancel-edit').hidden = false;
+  element('save').textContent = '保存修改';
+  element('message').textContent = '已进入编辑，尚未保存。';
+  element('label').focus();
+}
+
+// showItems 只保留安全字段，动态内容和操作按钮均通过 DOM API 创建。
+function showItems(items) {
+  const target = element('items');
+  target.replaceChildren();
+  for (const source of items) {
+    if (!source || typeof source !== 'object') continue;
+    const item = {};
+    for (const key of ['name', 'label', 'status', 'disabled', 'base_url', 'upstream-format', 'quota-url', 'catalog-url',
+      'allow-http', 'prefix_enabled', 'prefix_value', 'has_api_key', 'has_system_token', 'has_user_id']) item[key] = source[key];
+    const row = document.createElement('tr');
+    const values = [String(item.name || '') + '\n' + String(item.label || ''),
+      String(item.status || '') + (item.disabled ? '（禁用）' : ''), item.base_url || '—', item['upstream-format'] || '—',
+      item.prefix_enabled ? item.prefix_value : '关闭',
+      'API key：' + (item.has_api_key ? '有' : '无') + '；系统令牌：' + (item.has_system_token ? '有' : '无') + '；用户 ID：' + (item.has_user_id ? '有' : '无')];
+    for (const value of values) {
+      const cell = document.createElement('td');
+      cell.textContent = String(value || '—');
+      row.appendChild(cell);
+    }
+    const action = document.createElement('td');
+    const button = document.createElement('button');
+    button.type = 'button'; button.textContent = '编辑';
+    const reason = item.disabled ? '请先在 CPA 启用此认证；SDK 无法保证编辑时保留禁用状态。' :
+      (!editableConfig(item) ? '后端未返回完整安全配置，暂不能编辑；请先更新后端列表接口。' : '');
+    button.dataset.blocked = reason ? 'true' : 'false';
+    button.disabled = Boolean(reason) || busy || uncertain;
+    button.title = reason;
+    button.addEventListener('click', () => startEdit(item));
+    action.appendChild(button);
+    if (reason) {
+      const note = document.createElement('p'); note.className = 'hint'; note.textContent = reason; action.appendChild(note);
+    }
+    row.appendChild(action); target.appendChild(row);
+  }
+}
+
+// refreshList 启动时仅验证一次候选，其他读取由用户触发，不轮询、不自动重试。
+async function refreshList(startup = false) {
+  if (busy || !endpoint) return;
+  if (!element('password').value && !savedVerified && !(startup && savedKey)) {
+    element('list-message').textContent = '请先输入 CPA 管理密码。'; element('password').focus(); return;
+  }
+  const generation = authGeneration;
+  const validating = startup && !element('password').value && !savedVerified;
+  busy = true; updateButtons();
+  element('list-message').textContent = '正在读取认证列表…';
+  element('items').replaceChildren();
+  try {
+    const response = await managementFetch('GET', undefined, validating ? savedKey : '');
+    if (validating && generation !== authGeneration) {
+      element('list-message').textContent = '已停用保存登录，请手动输入管理密码后刷新。';
+      return;
+    }
+    if (!response.ok) {
+      element('list-message').textContent = response.status === 401 || response.status === 403 ? '管理认证失败，请手动输入密码。' :
+        '读取列表失败（HTTP ' + response.status + '），请稍后手动刷新。';
+      if (validating) {
+        useManual(false);
+        element('auth-message').textContent = '保存登录尚未验证，服务返回 HTTP ' + response.status + '。请手动输入密码；不会自动重试。';
+      }
+      return;
+    }
+    const data = await response.json();
+    if (validating && generation !== authGeneration) {
+      element('list-message').textContent = '已停用保存登录，请手动输入管理密码后刷新。';
+      return;
+    }
+    if (!Array.isArray(data.items)) throw new Error('invalid-response');
+    if (validating) {
+      savedVerified = true;
+      element('auth-message').textContent = '已使用 CPA 保存的登录（只读验证成功），可切换为手动密码。';
+    } else if (element('password').value) element('auth-message').textContent = '已使用手动管理密码读取列表。';
+    showItems(data.items);
+    element('list-message').textContent = '已读取 ' + data.items.length + ' 份认证。';
+    // 未知写入后必须丢弃旧编辑快照；用户确认列表后才能重新选择编辑。
+    if (uncertain) {
+      uncertain = false; cancelEdit();
+      element('message').textContent = '列表已刷新。请人工核对刚才的保存结果；旧编辑已取消，不会自动重试。';
+    } else if (editing) {
+      cancelEdit();
+      element('message').textContent = '列表已刷新，旧编辑已取消，请重新选择认证。';
+    }
+  } catch (_) {
+    if (validating && generation !== authGeneration) {
+      element('list-message').textContent = '已停用保存登录，请手动输入管理密码后刷新。';
+      return;
+    }
+    element('list-message').textContent = '网络、超时或响应异常，无法确认列表；请检查连接后手动刷新。';
+    if (validating) {
+      useManual(false);
+      element('auth-message').textContent = '保存登录验证遇到网络或响应异常，并非密码无效；已回退手动，不会自动重试。';
+    }
+  } finally { busy = false; updateButtons(); }
+}
+
+// submitAuth 新增使用 POST、编辑使用同接口 PATCH；空敏感值省略，删除余额凭据必须显式提交。
+async function submitAuth(event) {
+  event.preventDefault();
+  if (busy || uncertain) return;
+  if (!element('password').value && !savedVerified) {
+    element('message').textContent = '请先输入 CPA 管理密码。'; element('password').focus(); return;
+  }
+  if (!['openai', 'claude', 'openai-response'].includes(element('format').value)) {
+    element('message').textContent = '原协议不受支持，请选择支持的上游协议后保存；尚未保存。'; return;
+  }
+  const key = element('key').value.trim();
+  const token = element('system').value.trim();
+  const user = element('user').value.trim();
+  const clear = Boolean(editing && element('clear-balance').checked);
+  if (!editing && !key) { element('message').textContent = '新增认证必须填写 API key。'; return; }
+  if (clear && (token || user)) { element('message').textContent = '删除余额凭据与填写替换值冲突，请只选择一种操作；尚未保存。'; return; }
+  const hasToken = Boolean(token) || Boolean(editing && editing.has_system_token);
+  const hasUser = Boolean(user) || Boolean(editing && editing.has_user_id);
+  if (!clear && hasToken !== hasUser) {
+    element('message').textContent = '系统令牌和用户 ID 必须成对存在；可结合已有凭据只替换一项，缺失项必须补齐。尚未保存。'; return;
+  }
+  if (user && (!/^[0-9]+$/.test(user) || !/[1-9]/.test(user))) {
+    element('message').textContent = '用户 ID 必须是正十进制整数；尚未保存。'; return;
+  }
+  const body = {label: element('label').value.trim(), base_url: element('base').value.trim(),
+    'upstream-format': element('format').value, 'quota-url': element('quota').value.trim(), 'catalog-url': element('catalog').value.trim(),
+    'model-prefix': {enabled: element('prefix-enabled').checked, value: element('prefix').value.trim()}, 'allow-http': element('http').checked};
+  if (editing) { body.name = editing.name; body.clear_balance_credentials = clear; }
+  if (key) body.api_key = key;
+  if (token) body.system_access_token = token;
+  if (user) body.user_id = user;
+  busy = true; updateButtons();
+  element('message').textContent = '正在保存认证…';
+  try {
+    const response = await managementFetch(editing ? 'PATCH' : 'POST', body);
+    const data = await response.json().catch(() => ({}));
+    if ((response.status === 200 || response.status === 201) && data.status === 'saved') {
+      clearSecrets();
+      cancelEdit();
+      element('items').replaceChildren();
+      element('list-message').textContent = '配置已保存，请刷新列表后再编辑。';
+      element('message').textContent = '已保存认证；未验证上游权限。请刷新列表查看。';
+    } else if ((response.status >= 400 && response.status < 500) || response.status === 503 ||
+      (response.status === 502 && data.status === 'error')) {
+      // 只显示固定错误文案，避免后端异常信息意外回显凭据。
+      const messages = {400: '字段无效或删除与替换冲突，请检查配置。', 401: '管理认证失败，请检查密码。',
+        403: '管理访问被拒绝，请检查密码或权限。', 404: '认证不存在或编辑接口尚未提供，请刷新列表。',
+        405: '后端尚不支持此保存操作。', 409: '认证状态或类型冲突，请在 CPA 检查类型并启用后刷新列表。',
+        502: '读取最新认证失败，后端明确未调用保存，请手动刷新列表。', 503: '宿主保存入口不可用，请稍后手动处理。'};
+      element('message').textContent = '未保存（HTTP ' + response.status + '）：' + (messages[response.status] || '请求被拒绝，请检查配置。');
+    } else { throw new Error('unknown'); }
+  } catch (_) {
+    uncertain = true;
+    clearSecrets();
+    element('message').textContent = '保存结果未知（网络、超时或服务端响应异常），已锁定保存。请先刷新认证列表确认，勿重复提交。';
+  } finally { busy = false; updateButtons(); }
+}
+
+// 事件只响应人工操作；启动流程只读取一次存储和认证列表，不触发保存。
+element('add').addEventListener('submit', submitAuth);
+element('refresh').addEventListener('click', () => refreshList());
+element('cancel-edit').addEventListener('click', cancelEdit);
+element('manual').addEventListener('click', () => useManual(true));
+element('password').addEventListener('input', () => useManual(false));
+if (!endpoint) {
+  element('message').textContent = '页面路径无效，请从宿主插件菜单重新进入。';
+  element('auth-message').textContent = '页面路径无效，未读取保存登录。';
+} else if (element('password').value) {
+  useManual(false);
+} else {
+  savedKey = readSavedKey();
+  if (savedKey) refreshList(true);
+  else {
+    element('auth-message').textContent = '没有可用的 CPA 保存登录，请手动输入管理密码。';
+    element('password').focus();
+  }
+}
+updateButtons();
+</script>
+</body>
+</html>
